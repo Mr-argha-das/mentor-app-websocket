@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: classifywebsocket
+    runtime: python         # use "docker" if using Dockerfile
+    region: frankfurt       # or singapore/oregon/etc.
+    plan: starter
+    buildCommand: "pip install -r requirments.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # - key: MONGO_URI
+      #   sync: false
+    healthCheckPath: /healthz
