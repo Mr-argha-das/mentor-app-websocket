@@ -1,7 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict, List
 from sqlalchemy.orm import Session
-from db.database import get_db
+from db.database import get_db, SessionLocal
 from models.messages import Conversation, Message
 from models.userModels import User
 from firebase_admin import credentials
@@ -16,7 +16,8 @@ router = APIRouter()
 cred = credentials.Certificate(
     "./utils/mmp--mymarketplace-firebase-adminsdk-fbsvc-314a0c52e9.json"
 )
-firebase_admin.initialize_app(cred)
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred)
 
 # ---------------- HELPERS ---------------- #
 
@@ -25,40 +26,16 @@ def generate_random_string(length=10):
     return "".join(random.choice(chars) for _ in range(length))
 
 
-def serialize_user(user: User, include_sensitive: bool = False):
-    data = {
+def serialize_user(user: User):
+    return {
         "id": user.id,
         "full_name": user.full_name,
         "email": user.email,
         "phone_number": user.phone_number,
         "profile_pic": user.profile_pic,
         "user_type": user.user_type,
-        "student_id": user.student_id,
-        "service_type": user.service_type,
-        "description": user.description,
-        "skills_id": user.skills_id,
-        "total_experience": user.total_experience,
-        "users_field": user.users_field,
-        "language_known": user.language_known,
-        "linkedin_user": user.linkedin_user,
-        "dob": user.dob.isoformat() if user.dob else None,
-        "gender": user.gender,
-        "resume_upload": user.resume_upload,
         "status": user.status,
-        "coins": user.coins,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
     }
-
-    # ⚠️ Optional sensitive fields
-    if include_sensitive:
-        data.update({
-            "device_token": user.device_token,
-            "token": user.token,
-            "password": user.password,  # ❌ avoid unless admin use
-        })
-
-    return data
 
 # ---------------- CONNECTION MANAGER ---------------- #
 
@@ -70,9 +47,10 @@ class ConnectionManager:
     # ---------- CHAT SOCKET ---------- #
 
     async def connect(self, websocket: WebSocket, user_id: str):
-        # 🔐 allow only numeric IDs
+        user_id = str(user_id).strip()
+
         if not user_id.isdigit():
-            await websocket.close()
+            await websocket.close(code=1008)
             return
 
         if user_id in self.active_connections:
@@ -80,9 +58,11 @@ class ConnectionManager:
 
         await websocket.accept()
         self.active_connections[user_id] = websocket
+        print("CONNECTED USERS:", self.active_connections.keys())
 
     def disconnect(self, user_id: str):
-        self.active_connections.pop(user_id, None)
+        self.active_connections.pop(str(user_id), None)
+        print("DISCONNECTED:", user_id)
 
     # ---------- PRESENCE SOCKET ---------- #
 
@@ -96,40 +76,31 @@ class ConnectionManager:
 
     # ---------- CONNECTED USERS (MENTORS ONLY) ---------- #
 
-    async def _get_connected_mentor_users(self, db: Session):
-        user_ids = [
-            int(uid) for uid in self.active_connections.keys()
-            if uid.isdigit()
-        ]
+    async def _get_connected_mentor_users(self):
+        db = SessionLocal()
+        try:
+            user_ids = [int(uid) for uid in self.active_connections.keys()]
+            if not user_ids:
+                return []
 
-        if not user_ids:
-            return []
-
-        return (
-            db.query(User)
-            .filter(
-                User.id.in_(user_ids),
-                User.user_type == "Mentor"
+            return (
+                db.query(User)
+                .filter(
+                    User.id.in_(user_ids),
+                    User.user_type == "Mentor"
+                )
+                .all()
             )
-            .all()
-        )
+        finally:
+            db.close()
 
-    async def send_connected_users(self, websocket: WebSocket, db: Session):
-        users = await self._get_connected_mentor_users(db)
-
-        await websocket.send_json({
-            "type": "connected_users",
-            "count": len(users),
-            "users": [serialize_user(u, include_sensitive=True) for u in users]
-        })
-
-    async def broadcast_connected_users(self, db: Session):
-        users = await self._get_connected_mentor_users(db)
+    async def broadcast_connected_users(self):
+        users = await self._get_connected_mentor_users()
 
         data = {
             "type": "connected_users",
             "count": len(users),
-            "users": [serialize_user(u, include_sensitive=True) for u in users]
+            "users": [serialize_user(u) for u in users]
         }
 
         for ws in self.presence_connections:
@@ -144,58 +115,69 @@ class ConnectionManager:
         self,
         sender_id: str,
         receiver_id: str,
-        message: str,
-        db: Session
+        message: str
     ):
-        msg = Message(
-            sender_id=sender_id,
-            receiver_id=receiver_id,
-            message=message
-        )
-        db.add(msg)
-        db.commit()
-        db.refresh(msg)
+        sender_id = str(sender_id)
+        receiver_id = str(receiver_id)
 
-        conversation = db.query(Conversation).filter(
-            ((Conversation.user1_id == sender_id) &
-             (Conversation.user2_id == receiver_id)) |
-            ((Conversation.user1_id == receiver_id) &
-             (Conversation.user2_id == sender_id))
-        ).first()
-
-        if not conversation:
-            conversation = Conversation(
-                user1_id=sender_id,
-                user2_id=receiver_id,
-                last_message_id=msg.id
+        db = SessionLocal()
+        try:
+            # ✅ SAVE MESSAGE
+            msg = Message(
+                sender_id=sender_id,
+                receiver_id=receiver_id,
+                message=message
             )
-            db.add(conversation)
-        else:
-            conversation.last_message_id = msg.id
+            db.add(msg)
+            db.commit()
+            db.refresh(msg)
 
-        db.commit()
+            # ✅ CONVERSATION UPDATE
+            conversation = db.query(Conversation).filter(
+                ((Conversation.user1_id == sender_id) &
+                 (Conversation.user2_id == receiver_id)) |
+                ((Conversation.user1_id == receiver_id) &
+                 (Conversation.user2_id == sender_id))
+            ).first()
 
-        receiver_socket = self.active_connections.get(receiver_id)
-        if receiver_socket:
-            await receiver_socket.send_json({
-                "id": generate_random_string(),
-                "sender_id": sender_id,
-                "message": message
-            })
+            if not conversation:
+                conversation = Conversation(
+                    user1_id=sender_id,
+                    user2_id=receiver_id,
+                    last_message_id=msg.id
+                )
+                db.add(conversation)
+            else:
+                conversation.last_message_id = msg.id
+
+            db.commit()
+
+        finally:
+            db.close()
+
+        # ✅ REALTIME SEND (SENDER + RECEIVER)
+        payload = {
+            "id": msg.id,
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "message": message
+        }
+
+        for uid in [sender_id, receiver_id]:
+            ws = self.active_connections.get(uid)
+            if ws:
+                await ws.send_json(payload)
 
 # ---------------- MANAGER INSTANCE ---------------- #
 
 manager = ConnectionManager()
 
 # ---------------- CHAT WEBSOCKET ---------------- #
-# 🔥 ROUTE FIXED (no conflict now)
 
 @router.websocket("/chat/ws/user/{user_id}")
 async def chat_socket(websocket: WebSocket, user_id: str):
-    db: Session = next(get_db())
     await manager.connect(websocket, user_id)
-
-    await manager.broadcast_connected_users(db)
+    await manager.broadcast_connected_users()
 
     try:
         while True:
@@ -209,25 +191,25 @@ async def chat_socket(websocket: WebSocket, user_id: str):
                 continue
 
             await manager.send_private_message(
-                user_id, receiver_id, message, db
+                sender_id=user_id,
+                receiver_id=receiver_id,
+                message=message
             )
 
     except WebSocketDisconnect:
         manager.disconnect(user_id)
-        await manager.broadcast_connected_users(db)
+        await manager.broadcast_connected_users()
 
 # ---------------- PRESENCE WEBSOCKET ---------------- #
-# 🔥 ROUTE FIXED (no conflict now)
 
 @router.websocket("/chat/ws/presence/connected-users")
 async def connected_users_ws(websocket: WebSocket):
-    db: Session = next(get_db())
     await manager.connect_presence(websocket)
-
-    await manager.send_connected_users(websocket, db)
+    await manager.broadcast_connected_users()
 
     try:
         while True:
             await websocket.receive()
     except WebSocketDisconnect:
         manager.disconnect_presence(websocket)
+ 
