@@ -1,7 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict, List
 from sqlalchemy.orm import Session
-from db.database import get_db, SessionLocal
+from db.database import SessionLocal
 from models.messages import Conversation, Message
 from models.userModels import User
 from firebase_admin import credentials
@@ -53,12 +53,17 @@ class ConnectionManager:
             await websocket.close(code=1008)
             return
 
-        if user_id in self.active_connections:
-            await self.active_connections[user_id].close()
+        # 🔒 Close old connection safely
+        old_ws = self.active_connections.get(user_id)
+        if old_ws:
+            try:
+                await old_ws.close()
+            except:
+                pass
 
         await websocket.accept()
         self.active_connections[user_id] = websocket
-        print("CONNECTED USERS:", self.active_connections.keys())
+        print("CONNECTED USERS:", list(self.active_connections.keys()))
 
     def disconnect(self, user_id: str):
         self.active_connections.pop(str(user_id), None)
@@ -103,11 +108,16 @@ class ConnectionManager:
             "users": [serialize_user(u) for u in users]
         }
 
+        # 🔥 Remove dead presence sockets
+        alive_connections = []
         for ws in self.presence_connections:
             try:
                 await ws.send_json(data)
+                alive_connections.append(ws)
             except:
                 pass
+
+        self.presence_connections = alive_connections
 
     # ---------- PRIVATE MESSAGE ---------- #
 
@@ -122,7 +132,6 @@ class ConnectionManager:
 
         db = SessionLocal()
         try:
-            # ✅ SAVE MESSAGE
             msg = Message(
                 sender_id=sender_id,
                 receiver_id=receiver_id,
@@ -132,7 +141,6 @@ class ConnectionManager:
             db.commit()
             db.refresh(msg)
 
-            # ✅ CONVERSATION UPDATE
             conversation = db.query(Conversation).filter(
                 ((Conversation.user1_id == sender_id) &
                  (Conversation.user2_id == receiver_id)) |
@@ -155,7 +163,6 @@ class ConnectionManager:
         finally:
             db.close()
 
-        # ✅ REALTIME SEND (SENDER + RECEIVER)
         payload = {
             "id": msg.id,
             "sender_id": sender_id,
@@ -166,7 +173,10 @@ class ConnectionManager:
         for uid in [sender_id, receiver_id]:
             ws = self.active_connections.get(uid)
             if ws:
-                await ws.send_json(payload)
+                try:
+                    await ws.send_json(payload)
+                except:
+                    pass
 
 # ---------------- MANAGER INSTANCE ---------------- #
 
@@ -200,6 +210,11 @@ async def chat_socket(websocket: WebSocket, user_id: str):
         manager.disconnect(user_id)
         await manager.broadcast_connected_users()
 
+    except Exception as e:
+        manager.disconnect(user_id)
+        await manager.broadcast_connected_users()
+        print("WebSocket error:", e)
+
 # ---------------- PRESENCE WEBSOCKET ---------------- #
 
 @router.websocket("/chat/ws/presence/connected-users")
@@ -209,7 +224,11 @@ async def connected_users_ws(websocket: WebSocket):
 
     try:
         while True:
-            await websocket.receive()
+            await websocket.receive_text()   # ✅ SAFE RECEIVE
     except WebSocketDisconnect:
         manager.disconnect_presence(websocket)
- 
+        await manager.broadcast_connected_users()
+
+    except Exception:
+        manager.disconnect_presence(websocket)
+        await manager.broadcast_connected_users()
