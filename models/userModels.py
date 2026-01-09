@@ -7,6 +7,7 @@ from db.database import Base
 class User(Base):
     __tablename__ = "users"
 
+    # -------- EXISTING FIELDS (UNCHANGED) -------- #
     id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     full_name = Column(String(255))
     email = Column(String(255))
@@ -32,3 +33,34 @@ class User(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # -------- NEW FIELDS (ADDED ONLY) -------- #
+    experience_letter = Column(String(255))
+
+    status_mentor = Column(
+        Enum("pending", "approved", "rejected"),
+        default="pending",
+        nullable=False
+    )
+
+    education_year = Column(String(255))
+    college_or_institute_name = Column(String(255))
+    highest_qualification = Column(String(255))
+
+    job_role = Column(String(255))
+    job_location = Column(String(255))
+    job_company_name = Column(String(255))
+    salary = Column(String(255))
+
+    experience_letter_status = Column(
+        Enum("pending", "verified", "rejected"),
+        default="pending"
+    )
+
+    student_id_status = Column(
+        Enum("pending", "verified", "rejected"),
+        default="pending"
+    )
+
+    certificate = Column(String(255))
+    interest = Column(String(255))
